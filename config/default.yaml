@@ -1,0 +1,156 @@
+# =============================================================================
+#  ARBench — Annual-Report Benchmark for Small Language Models (local / Ollama)
+#  YourBench-style benchmark generation  +  LightEval-style evaluation
+# =============================================================================
+#  Every value here can be overridden by a profile (see `profiles:` below),
+#  selected with:   python run_benchmark.py --profile quick|standard|full|colab
+# -----------------------------------------------------------------------------
+
+input_dir: data/annual_report          # drop the annual report(s) here (PDF/DOCX/HTML/MD/TXT)
+output_dir: outputs                    # each run writes to outputs/<run_name>/
+cache_path: outputs/.cache/llm_cache.sqlite   # every LLM call is cached -> runs are resumable
+seed: 42
+
+ollama:
+  host: http://127.0.0.1:11434
+  auto_start: true          # start `ollama serve` if it is not running
+  auto_pull: true           # pull missing models automatically
+  request_timeout_s: 900
+  max_retries: 3
+  keep_alive: 30m
+  num_ctx: 8192             # context window used for every call
+  concurrency: 1            # parallel requests per model (raise on GPU, e.g. 4 on an L4)
+
+# ----------------------------------------------------------------------------
+# The Small Language Models under test
+# ----------------------------------------------------------------------------
+models:
+  - name: granite4.1:3b
+    label: Granite 4.1 (3B)
+  - name: gemma4:e2b-it-qat
+    label: Gemma 4 (E2B)
+  - name: qwen3:4b-instruct
+    label: Qwen 3 (4B)
+
+# ----------------------------------------------------------------------------
+# Stage 1-2: ingestion + chunking   (YourBench: ingestion.py / chunking.py)
+# ----------------------------------------------------------------------------
+ingestion:
+  extensions: [.pdf, .docx, .html, .htm, .md, .txt]
+  pdf_engine: auto          # auto -> pymupdf4llm (markdown + tables), fallback plain PyMuPDF
+  strip_headers_footers: true
+  min_chars_per_page_warning: 200   # warn if a PDF looks scanned (needs OCR)
+
+chunking:
+  target_tokens: 700        # structure-aware packing of paragraphs into ~N-token chunks
+  max_tokens: 1000
+  overlap_tokens: 80
+  min_tokens: 120           # chunks smaller than this are merged / dropped
+  min_quality: 0.35         # drop TOCs, number-only tables of contents, legal boilerplate
+
+# ----------------------------------------------------------------------------
+# Stage 3: summarisation  (YourBench: summarization.py – used only to orient the generator)
+# ----------------------------------------------------------------------------
+summarization:
+  enabled: true
+  model: auto               # auto -> first model in generation.models
+  max_chunks: 6             # summarise N evenly spaced chunks, then combine
+
+# ----------------------------------------------------------------------------
+# Stage 4: question generation  (YourBench: single_hop / multi_hop / multi-choice)
+# ----------------------------------------------------------------------------
+generation:
+  models: auto              # auto -> all models under test, rotated across chunks (reduces self-bias)
+  temperature: 0.4
+  single_hop:
+    num_chunks: 24          # chunks sampled (stratified over the whole report)
+    questions_per_chunk: 3
+  multi_hop:
+    num_groups: 6           # groups of 2 chunks that must be combined
+    chunks_per_group: 2
+    questions_per_group: 2
+  multi_choice:
+    num_chunks: 16
+    questions_per_chunk: 2
+
+# ----------------------------------------------------------------------------
+# Stage 5: filtering  (YourBench: citation_score_filtering + dedup)
+# ----------------------------------------------------------------------------
+filtering:
+  min_citation_score: 0.60      # fuzzy partial-ratio of citations vs. source chunk (0-1)
+  min_number_grounding: 0.50    # share of figures in the gold answer that appear in the source
+  dedup_similarity: 0.90        # near-duplicate question threshold (token-set ratio)
+  max_questions: 0              # 0 = keep all that pass
+  verify: true                  # cross-model check: drop items the non-author models unanimously reject
+  verifiers: auto               # auto -> the models under test (each item checked by the models that did not write it)
+
+# ----------------------------------------------------------------------------
+# Stage 6-7: evaluation  (LightEval-style tasks + metrics)
+# ----------------------------------------------------------------------------
+evaluation:
+  tasks:
+    grounded_qa: true       # open-book QA with the gold evidence chunk(s)      (YourBench gold_qa)
+    rag_qa: true            # QA over BM25-retrieved chunks from the whole report (realistic use)
+    multi_choice: true      # 4-option MCQ with evidence, letter extraction      (LightEval gpqa-style)
+    unanswerable: true      # question + unrelated chunk -> must abstain         (hallucination test)
+    closed_book: false      # no context (report is private -> measures guessing)
+  unanswerable_fraction: 0.35   # share of single-hop questions reused as unanswerable probes
+  rag_top_k: 4
+  temperature: 0.0
+  max_answer_tokens: 384
+  think: false              # disable "thinking" mode for models that support it
+
+judge:
+  enabled: true
+  strategy: cross           # cross  -> every answer is judged by the OTHER models (majority/mean)
+                            # fixed  -> use judge.models for everything
+                            # self   -> every model judges itself (not recommended)
+  models: auto              # used when strategy = fixed
+  temperature: 0.0
+  max_evidence_tokens: 1200
+
+scoring:
+  # composite "ARBench score" = weighted mean of each task's primary metric
+  weights:
+    grounded_qa: 0.30
+    rag_qa: 0.25
+    multi_choice: 0.20
+    unanswerable: 0.15
+    efficiency: 0.10        # normalised generation speed (tokens/s) across models
+  bootstrap_samples: 2000
+
+# =============================================================================
+# Profiles: overrides merged on top of the values above
+# =============================================================================
+profiles:
+  smoke:          # end-to-end plumbing test (a few minutes on CPU)
+    generation:
+      single_hop: {num_chunks: 3, questions_per_chunk: 2}
+      multi_hop: {num_groups: 1, questions_per_group: 1}
+      multi_choice: {num_chunks: 2, questions_per_chunk: 1}
+    summarization: {max_chunks: 2}
+    scoring: {bootstrap_samples: 300}
+
+  quick:          # ~1-2 h on a laptop CPU with 3B-4B models
+    generation:
+      single_hop: {num_chunks: 10, questions_per_chunk: 3}
+      multi_hop: {num_groups: 3, questions_per_group: 2}
+      multi_choice: {num_chunks: 8, questions_per_chunk: 2}
+    summarization: {max_chunks: 4}
+
+  standard: {}    # the defaults above (~4-8 h on CPU, ~20-40 min on an L4 GPU)
+
+  full:           # broadest coverage – recommended on a GPU
+    generation:
+      single_hop: {num_chunks: 60, questions_per_chunk: 3}
+      multi_hop: {num_groups: 15, questions_per_group: 2}
+      multi_choice: {num_chunks: 40, questions_per_chunk: 2}
+    summarization: {max_chunks: 10}
+
+  colab:          # Google Colab L4 (24 GB VRAM) – full coverage + parallel requests
+    ollama: {concurrency: 4, num_ctx: 12288}
+    generation:
+      single_hop: {num_chunks: 60, questions_per_chunk: 3}
+      multi_hop: {num_groups: 15, questions_per_group: 2}
+      multi_choice: {num_chunks: 40, questions_per_chunk: 2}
+    summarization: {max_chunks: 10}

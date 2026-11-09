@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+outputs/
+data/annual_report/*
+!data/annual_report/README.md
